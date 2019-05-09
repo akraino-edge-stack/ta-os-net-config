@@ -1,0 +1,630 @@
+diff --git a/etc/os-net-config/samples/ovs_dpdk.json b/etc/os-net-config/samples/ovs_dpdk.json
+index 5c84044..1dc523d 100644
+--- a/etc/os-net-config/samples/ovs_dpdk.json
++++ b/etc/os-net-config/samples/ovs_dpdk.json
+@@ -9,6 +9,7 @@
+                     "driver": "igb_uio",
+                     "mtu": 8192,
+                     "rx_queue": 4,
++                    "dpdk_lsc_interrupt": true,
+                     "members": [
+                         {
+                             "type": "interface",
+diff --git a/etc/os-net-config/samples/ovs_dpdk.yaml b/etc/os-net-config/samples/ovs_dpdk.yaml
+index 81aa212..9f0b0d3 100644
+--- a/etc/os-net-config/samples/ovs_dpdk.yaml
++++ b/etc/os-net-config/samples/ovs_dpdk.yaml
+@@ -22,6 +22,7 @@ network_config:
+         # should be less than the PMD cores as each queue will have one PMD
+         # thread (CPU) associated with it.
+         rx_queue: 4
++        dpdk_lsc_interrupt: true
+         members:
+             - type: interface
+               name: nic2
+diff --git a/etc/os-net-config/samples/ovs_dpdk_bond.json b/etc/os-net-config/samples/ovs_dpdk_bond.json
+index 410d459..02948c1 100644
+--- a/etc/os-net-config/samples/ovs_dpdk_bond.json
++++ b/etc/os-net-config/samples/ovs_dpdk_bond.json
+@@ -8,6 +8,7 @@
+                     "name" : "dpdkbond0",
+                     "mtu"  : 9000,
+                     "rx_queue": 4,
++                    "dpdk_lsc_interrupt": true,
+                     "members": [
+                         {
+                             "type" : "ovs_dpdk_port",
+diff --git a/etc/os-net-config/samples/ovs_dpdk_bond.yaml b/etc/os-net-config/samples/ovs_dpdk_bond.yaml
+index 17a73a3..896ca79 100644
+--- a/etc/os-net-config/samples/ovs_dpdk_bond.yaml
++++ b/etc/os-net-config/samples/ovs_dpdk_bond.yaml
+@@ -23,6 +23,7 @@ network_config:
+         # than the number of PMD cores, as each queue will have one PMD thread
+         # (CPU) associated with it.
+         rx_queue: 4
++        dpdk_lsc_interrupt: true
+         members:
+             -
+               type: ovs_dpdk_port
+diff --git a/os_net_config/__init__.py b/os_net_config/__init__.py
+index 609d5dc..0523bfc 100644
+--- a/os_net_config/__init__.py
++++ b/os_net_config/__init__.py
+@@ -253,7 +253,7 @@ class NetConfig(object):
+         msg = 'running ifdown on %s: %s' % (iftype, interface)
+         self.execute(msg, '/sbin/ifdown', interface, check_exit_code=False)
+ 
+-    def ifup(self, interface, iftype='interface'):
++    def ifup(self, interface, iftype='interface', check_exit_code=True):
+         """Run 'ifup' on the specified interface
+ 
+         If a failure occurs when bringing up the interface it will be saved
+@@ -265,7 +265,7 @@ class NetConfig(object):
+         """
+         msg = 'running ifup on %s: %s' % (iftype, interface)
+         try:
+-            self.execute(msg, '/sbin/ifup', interface)
++            self.execute(msg, '/sbin/ifup', interface, check_exit_code=check_exit_code)
+         except processutils.ProcessExecutionError as e:
+             self.errors.append(e)
+ 
+diff --git a/os_net_config/impl_ifcfg.py b/os_net_config/impl_ifcfg.py
+index 3a82597..3fd7eb5 100644
+--- a/os_net_config/impl_ifcfg.py
++++ b/os_net_config/impl_ifcfg.py
+@@ -18,10 +18,13 @@ import glob
+ import logging
+ import os
+ import re
++import time
+ 
++from netifaces import interfaces
+ import os_net_config
+ from os_net_config import objects
+ from os_net_config import utils
++from oslo_concurrency import processutils
+ 
+ 
+ logger = logging.getLogger(__name__)
+@@ -162,6 +165,10 @@ class IfcfgNetConfig(os_net_config.NetConfig):
+                 else:
+                     if base_opt.linux_bond_name:
+                         data += "PHYSDEV=%s\n" % base_opt.linux_bond_name
++            elif base_opt.device:
++                # vlan on OVS bridge with device, create linux vlan
++                data += "VLAN=yes\n"
++                data += "PHYSDEV=%s\n" % base_opt.device
+         elif isinstance(base_opt, objects.IvsInterface):
+             data += "TYPE=IVSIntPort\n"
+         elif isinstance(base_opt, objects.NfvswitchInternal):
+@@ -187,9 +194,11 @@ class IfcfgNetConfig(os_net_config.NetConfig):
+             data += "NFVSWITCH_BRIDGE=%s\n" % base_opt.nfvswitch_bridge_name
+         if base_opt.ovs_port:
+             if not isinstance(base_opt, objects.LinuxTeam):
+-                data += "DEVICETYPE=ovs\n"
++                if not (isinstance(base_opt, objects.Vlan)
++                        and base_opt.device):
++                    data += "DEVICETYPE=ovs\n"
+             if base_opt.bridge_name:
+-                if isinstance(base_opt, objects.Vlan):
++                if isinstance(base_opt, objects.Vlan) and not base_opt.device:
+                     data += "TYPE=OVSIntPort\n"
+                     data += "OVS_BRIDGE=%s\n" % base_opt.bridge_name
+                     data += "OVS_OPTIONS=\"tag=%s\"\n" % base_opt.vlan_id
+@@ -313,6 +322,10 @@ class IfcfgNetConfig(os_net_config.NetConfig):
+                 data += "RX_QUEUE=%i\n" % base_opt.rx_queue
+                 ovs_extra.append("set Interface $DEVICE " +
+                                  "options:n_rxq=$RX_QUEUE")
++            if base_opt.dpdk_lsc_interrupt:
++                data += "DPDK_LSC_INTERRUPT=true\n"
++                ovs_extra.append("set Interface $DEVICE " +
++                                 "options:dpdk-lsc-interrupt=$DPDK_LSC_INTERRUPT")
+         elif isinstance(base_opt, objects.OvsDpdkBond):
+             ovs_extra.extend(base_opt.ovs_extra)
+             # Referring to bug:1643026, the below commenting of the interfaces,
+@@ -349,6 +362,11 @@ class IfcfgNetConfig(os_net_config.NetConfig):
+                     for member in base_opt.members:
+                         ovs_extra.append("set Interface %s options:n_rxq="
+                                          "$RX_QUEUE" % member.name)
++                if base_opt.dpdk_lsc_interrupt:
++                    data += "DPDK_LSC_INTERRUPT=true\n"
++                    for member in base_opt.members:
++                        ovs_extra.append("set Interface %s options:dpdk-lsc-interrupt="
++                                         "$DPDK_LSC_INTERRUPT" % member.name)
+             if base_opt.ovs_options:
+                 data += "OVS_OPTIONS=\"%s\"\n" % base_opt.ovs_options
+             ovs_extra.extend(base_opt.ovs_extra)
+@@ -1043,14 +1061,27 @@ class IfcfgNetConfig(os_net_config.NetConfig):
+                     stop_dhclient_process(interface)
+ 
+             for interface in restart_interfaces:
+-                self.ifup(interface)
++                check_exit_code = True
++                if interface not in interfaces():
++                    # Most DPDK drivers do not generate 'netdev' interfaces
++                    logger.info('Device %s does not exist' % interface)
++                    check_exit_code = False
++                self.ifup(interface, check_exit_code=check_exit_code)
+ 
+             for linux_bond in restart_linux_bonds:
+                 self.ifup(linux_bond)
+ 
+             for bond in self.bond_primary_ifaces:
+-                self.ovs_appctl('bond/set-active-slave', bond,
+-                                self.bond_primary_ifaces[bond])
++                for i in range(61):
++                    try:
++                        self.ovs_appctl('bond/set-active-slave', bond,
++                                        self.bond_primary_ifaces[bond])
++                    except processutils.ProcessExecutionError:
++                        if i >= 60:
++                            raise
++                        time.sleep(5)
++                        continue
++                    break
+ 
+             if ivs_uplinks or ivs_interfaces:
+                 logger.info("Attach to ivs with "
+diff --git a/os_net_config/objects.py b/os_net_config/objects.py
+index 417f34a..1b321f3 100644
+--- a/os_net_config/objects.py
++++ b/os_net_config/objects.py
+@@ -993,7 +993,7 @@ class OvsDpdkPort(_BaseOpts):
+                  persist_mapping=False, defroute=True, dhclient_args=None,
+                  dns_servers=None, nm_controlled=False, members=None,
+                  driver='vfio-pci', ovs_options=None, ovs_extra=None,
+-                 rx_queue=None):
++                 rx_queue=None, dpdk_lsc_interrupt=False):
+ 
+         super(OvsDpdkPort, self).__init__(name, use_dhcp, use_dhcpv6,
+                                           addresses, routes, mtu, primary,
+@@ -1005,6 +1005,7 @@ class OvsDpdkPort(_BaseOpts):
+         self.ovs_extra = format_ovs_extra(self, ovs_extra)
+         self.driver = driver
+         self.rx_queue = rx_queue
++        self.dpdk_lsc_interrupt = dpdk_lsc_interrupt
+ 
+     @staticmethod
+     def from_json(json):
+@@ -1047,6 +1048,11 @@ class OvsDpdkPort(_BaseOpts):
+             raise InvalidConfigException(msg)
+ 
+         rx_queue = json.get('rx_queue', None)
++
++        dpdk_lsc_interrupt = strutils.bool_from_string(str(json.get('dpdk_lsc_interrupt', False)))
++        if not dpdk_lsc_interrupt and utils.is_mellanox(utils.get_pci_address(members[0].name, None), None):
++            dpdk_lsc_interrupt = True
++
+         ovs_options = json.get('ovs_options', [])
+         ovs_options = ['options:%s' % opt for opt in ovs_options]
+         ovs_extra = json.get('ovs_extra', [])
+@@ -1060,7 +1066,8 @@ class OvsDpdkPort(_BaseOpts):
+                            dns_servers=dns_servers,
+                            nm_controlled=nm_controlled, members=members,
+                            driver=driver, ovs_options=ovs_options,
+-                           ovs_extra=ovs_extra, rx_queue=rx_queue)
++                           ovs_extra=ovs_extra, rx_queue=rx_queue,
++                           dpdk_lsc_interrupt=dpdk_lsc_interrupt)
+ 
+ 
+ class OvsDpdkBond(_BaseOpts):
+@@ -1070,7 +1077,8 @@ class OvsDpdkBond(_BaseOpts):
+                  routes=None, mtu=None, primary=False, members=None,
+                  ovs_options=None, ovs_extra=None, nic_mapping=None,
+                  persist_mapping=False, defroute=True, dhclient_args=None,
+-                 dns_servers=None, nm_controlled=False, rx_queue=None):
++                 dns_servers=None, nm_controlled=False, rx_queue=None,
++                 dpdk_lsc_interrupt=False):
+         super(OvsDpdkBond, self).__init__(name, use_dhcp, use_dhcpv6,
+                                           addresses, routes, mtu, primary,
+                                           nic_mapping, persist_mapping,
+@@ -1080,6 +1088,7 @@ class OvsDpdkBond(_BaseOpts):
+         self.ovs_options = ovs_options
+         self.ovs_extra = format_ovs_extra(self, ovs_extra)
+         self.rx_queue = rx_queue
++        self.dpdk_lsc_interrupt = dpdk_lsc_interrupt
+ 
+         for member in self.members:
+             if member.primary:
+@@ -1127,6 +1136,11 @@ class OvsDpdkBond(_BaseOpts):
+                 msg = 'Members must be a list.'
+                 raise InvalidConfigException(msg)
+ 
++        dpdk_lsc_interrupt = strutils.bool_from_string(str(json.get('dpdk_lsc_interrupt', False)))
++        if not dpdk_lsc_interrupt and \
++           utils.is_mellanox(utils.get_pci_address(members[0].members[0].name, None), None):
++            dpdk_lsc_interrupt = True
++
+         return OvsDpdkBond(name, use_dhcp=use_dhcp, use_dhcpv6=use_dhcpv6,
+                            addresses=addresses, routes=routes, mtu=mtu,
+                            members=members, ovs_options=ovs_options,
+@@ -1134,7 +1148,8 @@ class OvsDpdkBond(_BaseOpts):
+                            persist_mapping=persist_mapping,
+                            defroute=defroute, dhclient_args=dhclient_args,
+                            dns_servers=dns_servers,
+-                           nm_controlled=nm_controlled, rx_queue=rx_queue)
++                           nm_controlled=nm_controlled, rx_queue=rx_queue,
++                           dpdk_lsc_interrupt=dpdk_lsc_interrupt)
+ 
+ 
+ class VppInterface(_BaseOpts):
+diff --git a/os_net_config/schema.yaml b/os_net_config/schema.yaml
+index 5060a34..62aeb41 100644
+--- a/os_net_config/schema.yaml
++++ b/os_net_config/schema.yaml
+@@ -529,6 +529,8 @@ definitions:
+                 $ref: "#/definitions/ovs_extra_or_param"
+             rx_queue:
+                 $ref: "#/definitions/int_or_param"
++            dpdk_lsc_interrupt:
++                $ref: "#/definitions/bool_or_param"
+             # common options:
+             use_dhcp:
+                 $ref: "#/definitions/bool_or_param"
+@@ -581,6 +583,8 @@ definitions:
+                 $ref: "#/definitions/ovs_extra_or_param"
+             rx_queue:
+                 $ref: "#/definitions/int_or_param"
++            dpdk_lsc_interrupt:
++                $ref: "#/definitions/bool_or_param"
+             # common options:
+             use_dhcp:
+                 $ref: "#/definitions/bool_or_param"
+diff --git a/os_net_config/tests/test_cli.py b/os_net_config/tests/test_cli.py
+index 32f9395..338f946 100644
+--- a/os_net_config/tests/test_cli.py
++++ b/os_net_config/tests/test_cli.py
+@@ -17,10 +17,12 @@
+ import os.path
+ import sys
+ 
++from mock import patch
+ import os_net_config
+ from os_net_config import cli
+ from os_net_config import impl_ifcfg
+ from os_net_config.tests import base
++from os_net_config.tests.test_utils import _PCI_OUTPUT
+ import six
+ 
+ 
+@@ -31,6 +33,22 @@ SAMPLE_BASE = os.path.join(REALPATH, '../../', 'etc',
+ 
+ class TestCli(base.TestCase):
+ 
++    def setUp(self):
++        patcher_get_pci_address = patch('os_net_config.utils.get_pci_address',
++                                        return_value=(_PCI_OUTPUT, None))
++        self.mock_get_pci_address = patcher_get_pci_address.start()
++        self.addCleanup(patcher_get_pci_address.stop)
++
++        interface_list = ['em1', 'em2', 'em3', 'vlan16', 'nic2', 'nic3',
++                          'bond0', 'bond1', 'dpdk0', 'dpdkbond0',
++                          'api201', 'storage202']
++        patcher_interfaces = patch('os_net_config.impl_ifcfg.interfaces',
++                                   return_value=interface_list)
++        self.mock_interfaces = patcher_interfaces.start()
++        self.addCleanup(patcher_interfaces.stop)
++
++        super(TestCli, self).setUp()
++
+     def run_cli(self, argstr, exitcodes=(0,)):
+         orig = sys.stdout
+         orig_stderr = sys.stderr
+diff --git a/os_net_config/tests/test_impl_ifcfg.py b/os_net_config/tests/test_impl_ifcfg.py
+index 337eeb3..a0abf93 100644
+--- a/os_net_config/tests/test_impl_ifcfg.py
++++ b/os_net_config/tests/test_impl_ifcfg.py
+@@ -19,6 +19,7 @@ import tempfile
+ 
+ from oslo_concurrency import processutils
+ 
++from mock import patch
+ import os_net_config
+ from os_net_config import impl_ifcfg
+ from os_net_config import NetConfig
+@@ -260,6 +261,13 @@ OVS_OPTIONS="tag=5"
+ BOOTPROTO=none
+ """
+ 
++_LINUX_VLAN_OVS_BRIDGE = _BASE_VLAN_OVS + """VLAN=yes
++PHYSDEV=em1
++TYPE=OVSPort
++OVS_BRIDGE=br-ctlplane
++BOOTPROTO=none
++"""
++
+ _VLAN_LINUX_BRIDGE = _BASE_VLAN_OVS + """VLAN=yes
+ PHYSDEV=em1
+ BRIDGE=br-ctlplane
+@@ -719,7 +727,7 @@ class TestIfcfgNetConfig(base.TestCase):
+         self.assertEqual(_VLAN_NO_IP, self.get_vlan_config('vlan5'))
+ 
+     def test_add_vlan_ovs(self):
+-        vlan = objects.Vlan('em1', 5)
++        vlan = objects.Vlan(None, 5)
+         vlan.ovs_port = True
+         self.provider.add_vlan(vlan)
+         self.assertEqual(_VLAN_OVS, self.get_vlan_config('vlan5'))
+@@ -731,13 +739,21 @@ class TestIfcfgNetConfig(base.TestCase):
+         self.assertEqual(expected, self.get_vlan_config('vlan5'))
+ 
+     def test_add_ovs_bridge_with_vlan(self):
+-        vlan = objects.Vlan('em1', 5)
++        vlan = objects.Vlan(None, 5)
+         bridge = objects.OvsBridge('br-ctlplane', use_dhcp=True,
+                                    members=[vlan])
+         self.provider.add_vlan(vlan)
+         self.provider.add_bridge(bridge)
+         self.assertEqual(_VLAN_OVS_BRIDGE, self.get_vlan_config('vlan5'))
+ 
++    def test_add_ovs_bridge_with_linux_vlan(self):
++        vlan = objects.Vlan('em1', 5)
++        bridge = objects.OvsBridge('br-ctlplane', use_dhcp=True,
++                                   members=[vlan])
++        self.provider.add_vlan(vlan)
++        self.provider.add_bridge(bridge)
++        self.assertEqual(_LINUX_VLAN_OVS_BRIDGE, self.get_vlan_config('vlan5'))
++
+     def test_add_linux_bridge_with_vlan(self):
+         vlan = objects.Vlan('em1', 5)
+         bridge = objects.LinuxBridge('br-ctlplane', use_dhcp=True,
+@@ -932,13 +948,14 @@ OVS_EXTRA="set Interface $DEVICE options:dpdk-devargs=0000:00:09.0"
+                          self.provider.bridge_data['br-link'])
+         self.assertEqual(dpdk0_config, self.get_interface_config('dpdk0'))
+ 
+-    def test_network_ovs_dpdk_bridge_and_port_with_mtu_rxqueue(self):
++    def test_network_ovs_dpdk_bridge_and_port_with_mtu_rxqueue_dpdklscinterrupt(self):
+         nic_mapping = {'nic1': 'eth0', 'nic2': 'eth1', 'nic3': 'eth2'}
+         self.stubbed_mapped_nics = nic_mapping
+ 
+         interface = objects.Interface(name='nic3')
+         dpdk_port = objects.OvsDpdkPort(name='dpdk0', members=[interface],
+-                                        mtu=9000, rx_queue=4)
++                                        mtu=9000, rx_queue=4,
++                                        dpdk_lsc_interrupt='true')
+         bridge = objects.OvsUserBridge('br-link', members=[dpdk_port])
+ 
+         def test_bind_dpdk_interfaces(ifname, driver, noop):
+@@ -970,10 +987,12 @@ DEVICETYPE=ovs
+ TYPE=OVSDPDKPort
+ OVS_BRIDGE=br-link
+ RX_QUEUE=4
++DPDK_LSC_INTERRUPT=true
+ MTU=9000
+ OVS_EXTRA="set Interface $DEVICE options:dpdk-devargs=0000:00:09.0 \
+ -- set Interface $DEVICE mtu_request=$MTU \
+--- set Interface $DEVICE options:n_rxq=$RX_QUEUE"
++-- set Interface $DEVICE options:n_rxq=$RX_QUEUE \
++-- set Interface $DEVICE options:dpdk-lsc-interrupt=$DPDK_LSC_INTERRUPT"
+ """
+         self.assertEqual(br_link_config,
+                          self.provider.bridge_data['br-link'])
+@@ -1068,7 +1087,8 @@ OVS_EXTRA="set Interface dpdk0 options:dpdk-devargs=0000:00:08.0 \
+         iface1 = objects.Interface(name='nic3')
+         dpdk1 = objects.OvsDpdkPort(name='dpdk1', members=[iface1])
+         bond = objects.OvsDpdkBond('dpdkbond0', rx_queue=4,
+-                                   members=[dpdk0, dpdk1])
++                                   members=[dpdk0, dpdk1],
++                                   dpdk_lsc_interrupt='true')
+         bridge = objects.OvsUserBridge('br-link', members=[bond])
+ 
+         def test_bind_dpdk_interfaces(ifname, driver, noop):
+@@ -1093,10 +1113,13 @@ TYPE=OVSDPDKBond
+ OVS_BRIDGE=br-link
+ BOND_IFACES="dpdk0 dpdk1"
+ RX_QUEUE=4
++DPDK_LSC_INTERRUPT=true
+ OVS_EXTRA="set Interface dpdk0 options:dpdk-devargs=0000:00:08.0 \
+ -- set Interface dpdk1 options:dpdk-devargs=0000:00:09.0 \
+ -- set Interface dpdk0 options:n_rxq=$RX_QUEUE \
+--- set Interface dpdk1 options:n_rxq=$RX_QUEUE"
++-- set Interface dpdk1 options:n_rxq=$RX_QUEUE \
++-- set Interface dpdk0 options:dpdk-lsc-interrupt=$DPDK_LSC_INTERRUPT \
++-- set Interface dpdk1 options:dpdk-lsc-interrupt=$DPDK_LSC_INTERRUPT"
+ """
+         self.assertEqual(dpdk_bond_config,
+                          self.get_interface_config('dpdkbond0'))
+@@ -1110,7 +1133,8 @@ OVS_EXTRA="set Interface dpdk0 options:dpdk-devargs=0000:00:08.0 \
+         iface1 = objects.Interface(name='nic3')
+         dpdk1 = objects.OvsDpdkPort(name='dpdk1', members=[iface1])
+         bond = objects.OvsDpdkBond('dpdkbond0', rx_queue=4, mtu=9000,
+-                                   members=[dpdk0, dpdk1])
++                                   members=[dpdk0, dpdk1],
++                                   dpdk_lsc_interrupt='true')
+         bridge = objects.OvsUserBridge('br-link', members=[bond])
+ 
+         def test_bind_dpdk_interfaces(ifname, driver, noop):
+@@ -1135,13 +1159,16 @@ TYPE=OVSDPDKBond
+ OVS_BRIDGE=br-link
+ BOND_IFACES="dpdk0 dpdk1"
+ RX_QUEUE=4
++DPDK_LSC_INTERRUPT=true
+ MTU=9000
+ OVS_EXTRA="set Interface dpdk0 options:dpdk-devargs=0000:00:08.0 \
+ -- set Interface dpdk1 options:dpdk-devargs=0000:00:09.0 \
+ -- set Interface dpdk0 mtu_request=$MTU \
+ -- set Interface dpdk1 mtu_request=$MTU \
+ -- set Interface dpdk0 options:n_rxq=$RX_QUEUE \
+--- set Interface dpdk1 options:n_rxq=$RX_QUEUE"
++-- set Interface dpdk1 options:n_rxq=$RX_QUEUE \
++-- set Interface dpdk0 options:dpdk-lsc-interrupt=$DPDK_LSC_INTERRUPT \
++-- set Interface dpdk1 options:dpdk-lsc-interrupt=$DPDK_LSC_INTERRUPT"
+ """
+         self.assertEqual(dpdk_bond_config,
+                          self.get_interface_config('dpdkbond0'))
+@@ -1150,6 +1177,11 @@ OVS_EXTRA="set Interface dpdk0 options:dpdk-devargs=0000:00:08.0 \
+ class TestIfcfgNetConfigApply(base.TestCase):
+ 
+     def setUp(self):
++        interface_list = ['em1', 'em2', 'bond0', 'bond1', 'ib0']
++        patcher_interfaces = patch('os_net_config.impl_ifcfg.interfaces',
++                                   return_value=interface_list)
++        self.mock_interfaces = patcher_interfaces.start()
++        self.addCleanup(patcher_interfaces.stop)
+         super(TestIfcfgNetConfigApply, self).setUp()
+         self.temp_ifcfg_file = tempfile.NamedTemporaryFile()
+         self.temp_bond_file = tempfile.NamedTemporaryFile()
+diff --git a/os_net_config/tests/test_objects.py b/os_net_config/tests/test_objects.py
+index 1c07eee..39a7884 100644
+--- a/os_net_config/tests/test_objects.py
++++ b/os_net_config/tests/test_objects.py
+@@ -17,8 +17,10 @@
+ import json
+ import six
+ 
++from mock import patch
+ from os_net_config import objects
+ from os_net_config.tests import base
++from os_net_config.tests.test_utils import _PCI_OUTPUT
+ from os_net_config import utils
+ 
+ 
+@@ -917,6 +919,13 @@ class TestNicMapping(base.TestCase):
+     # We want to test the function, not the dummy..
+     stub_mapped_nics = False
+ 
++    def setUp(self):
++        patcher = patch('os_net_config.utils.get_pci_address', return_value=(_PCI_OUTPUT, None))
++        self.mock_get_pci_address = patcher.start()
++        self.addCleanup(patcher.stop)
++
++        super(TestNicMapping, self).setUp()
++
+     def tearDown(self):
+         super(TestNicMapping, self).tearDown()
+         objects._MAPPED_NICS = None
+@@ -1122,6 +1131,13 @@ class TestOvsDpdkBond(base.TestCase):
+     # We want to test the function, not the dummy..
+     stub_mapped_nics = False
+ 
++    def setUp(self):
++        patcher = patch('os_net_config.utils.get_pci_address', return_value=(_PCI_OUTPUT, None))
++        self.mock_get_pci_address = patcher.start()
++        self.addCleanup(patcher.stop)
++
++        super(TestOvsDpdkBond, self).setUp()
++
+     def _stub_active_nics(self, nics):
+         def dummy_ordered_active_nics():
+             return nics
+@@ -1133,6 +1149,7 @@ class TestOvsDpdkBond(base.TestCase):
+ "type": "ovs_dpdk_bond",
+ "name": "dpdkbond0",
+ "use_dhcp": true,
++"dpdk_lsc_interrupt": true,
+ "members": [
+     {
+         "type": "ovs_dpdk_port",
+@@ -1160,6 +1177,7 @@ class TestOvsDpdkBond(base.TestCase):
+         bond = objects.object_from_json(json.loads(data))
+         self.assertEqual("dpdkbond0", bond.name)
+         self.assertTrue(bond.use_dhcp)
++        self.assertTrue(bond.dpdk_lsc_interrupt)
+         dpdk_port0 = bond.members[0]
+         self.assertEqual("dpdk0", dpdk_port0.name)
+         self.assertEqual("vfio-pci", dpdk_port0.driver)
+diff --git a/os_net_config/tests/test_utils.py b/os_net_config/tests/test_utils.py
+index e09b6f7..66a0e59 100644
+--- a/os_net_config/tests/test_utils.py
++++ b/os_net_config/tests/test_utils.py
+@@ -110,6 +110,8 @@ class TestUtils(base.TestCase):
+             if 'ethtool' in name:
+                 out = _PCI_OUTPUT
+                 return out, None
++            if 'lspci' in name:
++                return '', None
+         self.stubs.Set(processutils, 'execute', test_execute)
+         pci = utils.get_pci_address('nic2', False)
+         self.assertEqual('0000:00:19.0', pci)
+@@ -153,6 +155,8 @@ class TestUtils(base.TestCase):
+             if 'ethtool' in name:
+                 out = _PCI_OUTPUT
+                 return out, None
++            if 'lspci' in name:
++                return '', None
+             if 'driverctl' in name:
+                 return None, None
+ 
+@@ -171,6 +175,8 @@ class TestUtils(base.TestCase):
+             if 'ethtool' in name:
+                 out = _PCI_OUTPUT
+                 return out, None
++            if 'lspci' in name:
++                return '', None
+             if 'driverctl' in name:
+                 return None, 'Error'
+ 
+diff --git a/os_net_config/tests/test_validator.py b/os_net_config/tests/test_validator.py
+index 7991d9f..fd33ca2 100644
+--- a/os_net_config/tests/test_validator.py
++++ b/os_net_config/tests/test_validator.py
+@@ -264,6 +264,7 @@ class TestDeviceTypes(base.TestCase):
+                 "name": "dpdkbond0",
+                 "mtu": 9000,
+                 "rx_queue": 4,
++                "dpdk_lsc_interrupt": "true",
+                 "members": [{
+                     "type": "ovs_dpdk_port",
+                     "name": "dpdk0",
+diff --git a/os_net_config/utils.py b/os_net_config/utils.py
+index 27e888d..98e2741 100644
+--- a/os_net_config/utils.py
++++ b/os_net_config/utils.py
+@@ -216,6 +216,17 @@ def bind_dpdk_interfaces(ifname, driver, noop):
+     pci_address = get_pci_address(ifname, noop)
+     if not noop:
+         if pci_address:
++            if is_mellanox(pci_address, noop):
++                # Mellanox is binded only with dpdk-devargs and does not need
++                # vfio-pci like e.g. Intel Niantic. Just update DPDK map here.
++                try:
++                    mac_address = interface_mac(ifname)
++                    _update_dpdk_map(ifname, pci_address, mac_address, driver)
++                except Exception as exp:
++                    logger.info('DPDK map update failed: {}'.format(exp))
++                    raise
++                return
++
+             # modbprobe of the driver has to be done before binding.
+             # for reboots, puppet will add the modprobe to /etc/rc.modules
+             if 'vfio-pci' in driver:
+@@ -252,6 +263,19 @@ def bind_dpdk_interfaces(ifname, driver, noop):
+                     {'name': ifname, 'driver': driver})
+ 
+ 
++def is_mellanox(pci_address, noop):
++    if not noop:
++        try:
++            file_path = '/sys/bus/pci/devices/{}/vendor'.format(pci_address)
++            with open(file_path, 'r') as vendor_file:
++                if '0x15b3' in vendor_file.read():
++                    return True
++                else:
++                    return False
++        except Exception:
++            return False
++
++
+ def get_pci_address(ifname, noop):
+     # TODO(skramaja): Validate if the given interface supports dpdk
+     if not noop:
+diff --git a/pylintrc b/pylintrc
+new file mode 100644
+index 0000000..81b4f50
+--- /dev/null
++++ b/pylintrc
+@@ -0,0 +1,2 @@
++[MESSAGES CONTROL]
++disable=E1101,F0401,E0211
+diff --git a/tox.ini b/tox.ini
+index 1dd9da1..962540a 100644
+--- a/tox.ini
++++ b/tox.ini
+@@ -28,6 +28,6 @@ commands = python setup.py build_sphinx
+ # E123, E125 skipped as they are invalid PEP-8.
+ 
+ show-source = True
+-ignore = E123,E125
++ignore = E123,E125,E501
+ builtins = _
+ exclude=.venv,.git,.tox,dist,doc,*openstack/common*,*lib/python*,*egg,build
