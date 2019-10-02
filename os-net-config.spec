@@ -1,5 +1,5 @@
 Name:       os-net-config
-Version:    7.3.0
+Version:    10.4.1
 Release:    0.20170914.77fe592%{?dist}.1
 Summary:    Host network configuration tool
 
