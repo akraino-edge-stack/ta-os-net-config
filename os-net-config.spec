@@ -1,11 +1,11 @@
 Name:       os-net-config
-Version:    7.3.0
-Release:    0.20170914.77fe592%{?dist}.1
+Version:    10.4.1
+Release:    0.20191003.14e46a5%{?dist}.1
 Summary:    Host network configuration tool
 
 License:    %{_platform_licence} and ASL 2.0
 URL:        http://pypi.python.org/pypi/%{name}
-Source0:    https://files.pythonhosted.org/packages/26/8d/c9ce44fd6a805a4ec56cba59c0a6743fba2230b7b79aa57a48709e94f47c/%{name}-%{version}.tar.gz
+Source0:    https://files.pythonhosted.org/packages/e6/4f/2e344cbe95e57c151c747df6367ace569697af7967b5b464d76ffcc3a4d8/%{name}-%{version}.tar.gz
 Patch0:     0001-initial.patch
 Vendor:     OpenStack Foundation and %{_platform_vendor} modified
 
@@ -54,4 +54,5 @@ Host network configuration tool for OpenStack.
 %doc LICENSE
 %doc doc/build/html
 %{_bindir}/os-net-config
+%{_bindir}/os-net-config-sriov
 %{python_sitelib}/os_net_config*
